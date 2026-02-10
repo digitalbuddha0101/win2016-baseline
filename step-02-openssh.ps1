@@ -1,54 +1,91 @@
-# step-02-openssh.ps1
+# step-02-openssh.ps1  (Windows Server 2016 compatible)
+# Installs Win32-OpenSSH from the latest GitHub release, registers sshd, opens firewall.
+
 $ErrorActionPreference = "Stop"
 
-Write-Host "=== STEP 02: Install + enable OpenSSH Server ===" -ForegroundColor Cyan
+Write-Host "=== STEP 02: Install + enable OpenSSH Server (Win32-OpenSSH) ===" -ForegroundColor Cyan
 
-# Install capability if missing
-$cap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
-if (-not $cap) { throw "OpenSSH.Server capability not found on this OS image." }
+# Server 2016 often needs TLS 1.2 for GitHub endpoints
+try {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+} catch {}
 
-if ($cap.State -ne "Installed") {
-  Write-Host "Installing OpenSSH.Server..." -ForegroundColor Yellow
-  Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+function Assert-Admin {
+  $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if (-not $isAdmin) { throw "Run PowerShell as Administrator." }
+}
+
+function Download-OpenSSHZip {
+  $api = "https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest"
+  Write-Host "Fetching latest release metadata..." -ForegroundColor Gray
+  $rel = Invoke-RestMethod -Uri $api -UseBasicParsing
+
+  $asset = $rel.assets | Where-Object { $_.name -match "OpenSSH-Win64\.zip$" } | Select-Object -First 1
+  if (-not $asset) { throw "Could not find OpenSSH-Win64.zip in latest release assets." }
+
+  $zipPath = Join-Path $env:TEMP $asset.name
+  Write-Host ("Downloading {0} ..." -f $asset.name) -ForegroundColor Gray
+  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
+
+  return $zipPath
+}
+
+Assert-Admin
+
+$installDir = "C:\Program Files\OpenSSH"
+$tempDir    = Join-Path $env:TEMP ("openssh_" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $tempDir | Out-Null
+
+if (Test-Path $installDir) {
+  Write-Host "OpenSSH appears to already exist at: $installDir" -ForegroundColor Yellow
 } else {
-  Write-Host "OpenSSH.Server already installed." -ForegroundColor Green
+  $zip = Download-OpenSSHZip
+  Expand-Archive -Path $zip -DestinationPath $tempDir -Force
+
+  $extracted = Join-Path $tempDir "OpenSSH-Win64"
+  if (-not (Test-Path $extracted)) { throw "Unexpected zip layout; OpenSSH-Win64 folder not found." }
+
+  New-Item -ItemType Directory -Path $installDir | Out-Null
+  Copy-Item -Path (Join-Path $extracted "*") -Destination $installDir -Recurse -Force
+  Write-Host "Copied OpenSSH to $installDir" -ForegroundColor Green
 }
 
-# Ensure service exists
-$svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
-if (-not $svc) { throw "sshd service not found after install." }
+# Install sshd service using the bundled script
+$installScript = Join-Path $installDir "install-sshd.ps1"
+if (-not (Test-Path $installScript)) { throw "Missing install script: $installScript" }
 
-# Start + set automatic
-Write-Host "Enabling sshd service..." -ForegroundColor Yellow
-Set-Service -Name sshd -StartupType Automatic
-Start-Service -Name sshd
+Write-Host "Registering sshd service..." -ForegroundColor Gray
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installScript
 
-# Optional: ssh-agent (not required, but harmless)
-$agent = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
-if ($agent) {
-  Set-Service -Name ssh-agent -StartupType Manual
+# Set services to start automatically and start them
+foreach ($svc in @("sshd","ssh-agent")) {
+  $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+  if ($s) {
+    Set-Service -Name $svc -StartupType Automatic
+    if ($s.Status -ne "Running") { Start-Service -Name $svc }
+  }
 }
 
-# Firewall rule (inbound TCP 22)
-$rule = Get-NetFirewallRule -DisplayName "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue
+# Firewall rule for TCP 22
+$ruleName = "OpenSSH-Server-In-TCP"
+$rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
 if (-not $rule) {
-  Write-Host "Creating firewall rule for TCP/22..." -ForegroundColor Yellow
-  New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" `
-    -DisplayName "OpenSSH-Server-In-TCP" `
-    -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
-} else {
-  Write-Host "Firewall rule already present: OpenSSH-Server-In-TCP" -ForegroundColor Green
+  Write-Host "Creating firewall rule for TCP 22..." -ForegroundColor Gray
+  New-NetFirewallRule -Name "sshd" -DisplayName $ruleName -Enabled True -Direction Inbound `
+    -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
 }
 
-# Status report
-Write-Host ""
-Write-Host "sshd status:" -ForegroundColor Cyan
-Get-Service sshd | Format-List Status, Name, StartType
+# Verify sshd is listening
+Write-Host "Verifying listener on TCP 22..." -ForegroundColor Gray
+$listen = netstat -ano | Select-String ":22" | Select-String "LISTENING"
+if (-not $listen) {
+  Write-Host "WARN: sshd not seen listening on :22 yet. Check service/logs." -ForegroundColor Yellow
+} else {
+  Write-Host "PASS: sshd appears to be listening on TCP 22." -ForegroundColor Green
+}
 
-Write-Host ""
-Write-Host "Listening ports (expect :22)..." -ForegroundColor Cyan
-netstat -ano | findstr ":22"
+Write-Host "SSHD status:" -ForegroundColor Cyan
+Get-Service sshd | Format-Table -AutoSize
 
-Write-Host ""
-Write-Host "DONE: OpenSSH server installed and enabled." -ForegroundColor Green
-exit 0
+Write-Host "Done." -ForegroundColor Green
